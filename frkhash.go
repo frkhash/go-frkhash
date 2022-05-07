@@ -16,7 +16,7 @@
 // You should have received a copy of the GNU Lesser General Public License
 // along with the go-ethereum library. If not, see <http://www.gnu.org/licenses/>.
 
-package etchash
+package frkhash
 
 import (
 	"encoding/binary"
@@ -77,9 +77,9 @@ func defaultDir() string {
 		home = user.HomeDir
 	}
 	if runtime.GOOS == "windows" {
-		return filepath.Join(home, "AppData", "Etchash")
+		return filepath.Join(home, "AppData", "Frkhash")
 	}
-	return filepath.Join(home, ".etchash")
+	return filepath.Join(home, ".frkhash")
 }
 
 // isLittleEndian returns whether the local system is running in little or big
@@ -223,7 +223,7 @@ func newlru(what string, maxItems int, new func(epoch uint64, epochLength uint64
 		maxItems = 1
 	}
 	cache, _ := simplelru.NewLRU(maxItems, func(key, value interface{}) {
-		log.Trace("Evicted etchash "+what, "epoch", key)
+		log.Trace("Evicted frkhash "+what, "epoch", key)
 	})
 	return &lru{what: what, new: new, cache: cache}
 }
@@ -241,7 +241,7 @@ func (lru *lru) get(epoch uint64, epochLength uint64, ecip1099FBlock *uint64) (i
 		if lru.future > 0 && lru.future == epoch {
 			item = lru.futureItem
 		} else {
-			log.Trace("Requiring new etchash "+lru.what, "epoch", epoch)
+			log.Trace("Requiring new frkhash "+lru.what, "epoch", epoch)
 			item = lru.new(epoch, epochLength)
 		}
 		lru.cache.Add(epoch, item)
@@ -260,7 +260,7 @@ func (lru *lru) get(epoch uint64, epochLength uint64, ecip1099FBlock *uint64) (i
 
 	// Update the 'future item' if epoch is larger than previously seen.
 	if epoch < maxEpoch-1 && lru.future < nextEpoch {
-		log.Trace("Requiring new future etchash "+lru.what, "epoch", nextEpoch)
+		log.Trace("Requiring new future frkhash "+lru.what, "epoch", nextEpoch)
 		future = lru.new(nextEpoch, nextEpochLength)
 		lru.future = nextEpoch
 		lru.futureItem = future
@@ -268,7 +268,7 @@ func (lru *lru) get(epoch uint64, epochLength uint64, ecip1099FBlock *uint64) (i
 	return item, future
 }
 
-// cache wraps an etchash cache with some metadata to allow easier concurrent use.
+// cache wraps an frkhash cache with some metadata to allow easier concurrent use.
 type cache struct {
 	epoch       uint64    // Epoch for which this cache is relevant
 	epochLength uint64    // Epoch length (ECIP-1099)
@@ -323,7 +323,7 @@ func isBadCache(epoch uint64, epochLength uint64, data []uint32) (bool, string) 
 	return false, ""
 }
 
-// newCache creates a new etchash verification cache and returns it as a plain Go
+// newCache creates a new frkhash verification cache and returns it as a plain Go
 // interface to be usable in an LRU cache.
 func newCache(epoch uint64, epochLength uint64, uip1Epoch *uint64) interface{} {
 	return &cache{epoch: epoch, epochLength: epochLength, uip1Epoch: uip1Epoch}
@@ -359,7 +359,7 @@ func (c *cache) generate(dir string, limit int, lock bool, test bool) {
 		var err error
 		c.dump, c.mmap, c.cache, err = memoryMap(path, lock)
 		if err == nil {
-			logger.Debug("Loaded old etchash cache from disk")
+			logger.Debug("Loaded old frkhash cache from disk")
 			isBad, hash := isBadCache(c.epoch, c.epochLength, c.cache)
 			if isBad {
 				// cache is bad. Set err, then continue as if cache could not be read from disk.
@@ -368,12 +368,12 @@ func (c *cache) generate(dir string, limit int, lock bool, test bool) {
 				return
 			}
 		}
-		logger.Debug("Failed to load old etchash cache", "err", err)
+		logger.Debug("Failed to load old frkhash cache", "err", err)
 
 		// No usable previous cache available, create a new cache file to fill
 		c.dump, c.mmap, c.cache, err = memoryMapAndGenerate(path, size, lock, func(buffer []uint32) { generateCache(buffer, c.epoch, c.epochLength, c.uip1Epoch, seed) })
 		if err != nil {
-			logger.Error("Failed to generate mapped etchash cache", "err", err)
+			logger.Error("Failed to generate mapped frkhash cache", "err", err)
 
 			c.cache = make([]uint32, size/4)
 			generateCache(c.cache, c.epoch, c.epochLength, c.uip1Epoch, seed)
@@ -397,8 +397,17 @@ func (c *cache) finalizer() {
 }
 
 func (c *cache) compute(dagSize uint64, hash common.Hash, nonce uint64) (common.Hash, common.Hash) {
-	// ret := C.etchash_light_compute_internal(cache.ptr, C.uint64_t(dagSize), hashToH256(hash), C.uint64_t(nonce))
+	// ret := C.frkhash_light_compute_internal(cache.ptr, C.uint64_t(dagSize), hashToH256(hash), C.uint64_t(nonce))
 	digest, result := hashimotoLight(dagSize, c.cache, hash.Bytes(), nonce)
+	// Caches are unmapped in a finalizer. Ensure that the cache stays alive
+	// until after the call to hashimotoLight so it's not unmapped while being used.
+	runtime.KeepAlive(c)
+	return common.BytesToHash(digest), common.BytesToHash(result)
+}
+
+func (c *cache) computeFrkhash(hash common.Hash, nonce uint64) (common.Hash, common.Hash) {
+	// ret := C.frkhash_light_compute_internal(cache.ptr, C.uint64_t(dagSize), hashToH256(hash), C.uint64_t(nonce))
+	digest, result := frankomoto(hash.Bytes(), nonce)
 	// Caches are unmapped in a finalizer. Ensure that the cache stays alive
 	// until after the call to hashimotoLight so it's not unmapped while being used.
 	runtime.KeepAlive(c)
@@ -417,11 +426,12 @@ type Light struct {
 	NumCaches      int // Maximum number of caches to keep before eviction (only init, don't modify)
 	ecip1099FBlock *uint64
 	uip1Epoch      *uint64
+	xip5Block      *uint64
 }
 
 // Verify checks whether the block's nonce is valid.
 func (l *Light) Verify(block Block) bool {
-	// TODO: do etchash_quick_verify before getCache in order
+	// TODO: do frkhash_quick_verify before getCache in order
 	// to prevent DOS attacks.
 	blockNum := block.NumberU64()
 	if blockNum >= epochLengthDefault*2048 {
@@ -433,7 +443,7 @@ func (l *Light) Verify(block Block) bool {
 	/* Cannot happen if block header diff is validated prior to PoW, but can
 		 happen if PoW is checked first due to parallel PoW checking.
 		 We could check the minimum valid difficulty but for SoC we avoid (duplicating)
-	   Ethereum protocol consensus rules here which are not in scope of Etchash
+	   Ethereum protocol consensus rules here which are not in scope of Frkhash
 	*/
 	if difficulty.Cmp(common.Big0) == 0 {
 		log.Debug("invalid block difficulty")
@@ -449,7 +459,14 @@ func (l *Light) Verify(block Block) bool {
 		dagSize = dagSizeForTesting
 	}
 	// Recompute the hash using the cache.
-	mixDigest, result := cache.compute(uint64(dagSize), block.HashNoNonce(), block.Nonce())
+	var mixDigest common.Hash
+	var result common.Hash
+
+	if l.xip5Block != nil && blockNum >= *l.xip5Block {
+		mixDigest, result = cache.computeFrkhash(block.HashNoNonce(), block.Nonce())
+	} else {
+		mixDigest, result = cache.compute(uint64(dagSize), block.HashNoNonce(), block.Nonce())
+	}
 
 	// avoid mixdigest malleability as it's not included in a block's "hashNononce"
 	if block.MixDigest() != mixDigest {
@@ -468,6 +485,11 @@ func (l *Light) Compute(blockNum uint64, hashNoNonce common.Hash, nonce uint64) 
 
 	cache := l.getCache(blockNum)
 	dagSize := datasetSize(epoch)
+
+	if blockNum >= *l.xip5Block {
+		return cache.computeFrkhash(hashNoNonce, nonce)
+	}
+
 	return cache.compute(uint64(dagSize), hashNoNonce, nonce)
 }
 
@@ -533,7 +555,7 @@ func (l *Light) getCache(blockNum uint64) *cache {
 	return c
 }
 
-/// dataset wraps an etchash dataset with some metadata to allow easier concurrent use.
+/// dataset wraps an frkhash dataset with some metadata to allow easier concurrent use.
 type dataset struct {
 	epoch       uint64    // Epoch for which this cache is relevant
 	epochLength uint64    // Epoch length (ECIP-1099)
@@ -546,7 +568,7 @@ type dataset struct {
 	used        time.Time
 }
 
-// newDataset creates a new etchash mining dataset and returns it as a plain Go
+// newDataset creates a new frkhash mining dataset and returns it as a plain Go
 // interface to be usable in an LRU cache.
 func newDataset(epoch uint64, epochLength uint64, uip1Epoch *uint64) interface{} {
 	return &dataset{epoch: epoch, epochLength: epochLength, uip1Epoch: uip1Epoch}
@@ -591,7 +613,7 @@ func (d *dataset) generate(dir string, limit int, lock bool, test bool) {
 		var err error
 		d.dump, d.mmap, d.dataset, err = memoryMap(path, lock)
 		if err == nil {
-			logger.Debug("Loaded old etchash dataset from disk", "path", path)
+			logger.Debug("Loaded old frkhash dataset from disk", "path", path)
 			isBad, hash := isBadCache(d.epoch, d.epochLength, d.dataset)
 			if isBad {
 				// dataset is bad. Continue as if cache could not be read from disk.
@@ -603,7 +625,7 @@ func (d *dataset) generate(dir string, limit int, lock bool, test bool) {
 				return
 			}
 		}
-		logger.Debug("Failed to load old etchash dataset", "err", err)
+		logger.Debug("Failed to load old frkhash dataset", "err", err)
 
 		// No usable previous dataset available, create a new dataset file to fill
 		cache := make([]uint32, csize/4)
@@ -611,7 +633,7 @@ func (d *dataset) generate(dir string, limit int, lock bool, test bool) {
 
 		d.dump, d.mmap, d.dataset, err = memoryMapAndGenerate(path, dsize, lock, func(buffer []uint32) { generateDataset(buffer, d.epoch, d.epochLength, cache) })
 		if err != nil {
-			logger.Error("Failed to generate mapped etchash dataset", "err", err)
+			logger.Error("Failed to generate mapped frkhash dataset", "err", err)
 
 			d.dataset = make([]uint32, dsize/2)
 			generateDataset(d.dataset, d.epoch, d.epochLength, cache)
@@ -641,7 +663,7 @@ func (d *dataset) finalizer() {
 	}
 }
 
-// MakeDAG generates a new etchash dataset and optionally stores it to disk.
+// MakeDAG generates a new frkhash dataset and optionally stores it to disk.
 func MakeDAG(block uint64, epochLength uint64, dir string) {
 	epoch := calcEpoch(block, epochLength)
 	d := dataset{epoch: epoch, epochLength: epochLength}
@@ -660,6 +682,7 @@ type Full struct {
 	current        *dataset   // current full DAG
 	ecip1099FBlock *uint64
 	uip1Epoch      *uint64
+	xip5Block      *uint64
 }
 
 func (pow *Full) getDAG(blockNum uint64) (d *dataset) {
@@ -679,6 +702,17 @@ func (pow *Full) getDAG(blockNum uint64) (d *dataset) {
 }
 
 func (pow *Full) Search(block Block, stop <-chan struct{}, index int) (nonce uint64, mixDigest []byte) {
+
+	if pow.xip5Block != nil {
+		if *pow.xip5Block >= block.NumberU64() {
+			return pow.SearchFrk(block, stop, index)
+		}
+	}
+
+	return pow.SearchDag(block, stop, index)
+}
+
+func (pow *Full) SearchDag(block Block, stop <-chan struct{}, index int) (nonce uint64, mixDigest []byte) {
 	dag := pow.getDAG(block.NumberU64())
 
 	r := rand.New(rand.NewSource(time.Now().UnixNano()))
@@ -713,7 +747,55 @@ func (pow *Full) Search(block Block, stop <-chan struct{}, index int) (nonce uin
 			digest, result := hashimotoFull(dag.dataset, hash.Bytes(), nonce)
 			// result := h256ToHash(ret.result).Big()
 			bigres := common.BytesToHash(result).Big()
-			// TODO: disagrees with the spec https://github.com/ethereum/wiki/wiki/Etchash#mining
+			// TODO: disagrees with the spec https://github.com/ethereum/wiki/wiki/Frkhash#mining
+			if digest != nil && bigres.Cmp(target) <= 0 {
+				mixDigest = digest
+				atomic.AddInt32(&pow.hashRate, -previousHashrate)
+				return nonce, mixDigest
+			}
+			nonce += 1
+		}
+
+		if !pow.turbo {
+			time.Sleep(20 * time.Microsecond)
+		}
+	}
+}
+
+func (pow *Full) SearchFrk(block Block, stop <-chan struct{}, index int) (nonce uint64, mixDigest []byte) {
+	r := rand.New(rand.NewSource(time.Now().UnixNano()))
+	diff := block.Difficulty()
+
+	i := int64(0)
+	starti := i
+	start := time.Now().UnixNano()
+	previousHashrate := int32(0)
+
+	nonce = uint64(r.Int63())
+	hash := block.HashNoNonce()
+	target := new(big.Int).Div(maxUint256, diff)
+	for {
+		select {
+		case <-stop:
+			atomic.AddInt32(&pow.hashRate, -previousHashrate)
+			return 0, nil
+		default:
+			i++
+
+			// we don't have to update hash rate on every nonce, so update after
+			// first nonce check and then after 2^X nonces
+			if i == 2 || ((i % (1 << 16)) == 0) {
+				elapsed := time.Now().UnixNano() - start
+				hashes := (float64(1e9) / float64(elapsed)) * float64(i-starti)
+				hashrateDiff := int32(hashes) - previousHashrate
+				previousHashrate = int32(hashes)
+				atomic.AddInt32(&pow.hashRate, hashrateDiff)
+			}
+
+			digest, result := frankomoto(hash.Bytes(), nonce)
+			// result := h256ToHash(ret.result).Big()
+			bigres := common.BytesToHash(result).Big()
+			// TODO: disagrees with the spec https://github.com/ethereum/wiki/wiki/Frkhash#mining
 			if digest != nil && bigres.Cmp(target) <= 0 {
 				mixDigest = digest
 				atomic.AddInt32(&pow.hashRate, -previousHashrate)
@@ -737,25 +819,34 @@ func (pow *Full) Turbo(on bool) {
 	pow.turbo = on
 }
 
-// Etchash combines block verification with Light and
+// Frkhash combines block verification with Light and
 // nonce searching with Full into a single proof of work.
-type Etchash struct {
+type Frkhash struct {
 	*Light
 	*Full
 }
 
 // New creates an instance of the proof of work.
-func New(ecip1099FBlock *uint64, uip1FEpoch *uint64) *Etchash {
+func New(ecip1099FBlock *uint64, uip1FEpoch *uint64, xip5Block *uint64) *Frkhash {
 	var light = new(Light)
 	light.ecip1099FBlock = ecip1099FBlock
+	light.xip5Block = xip5Block
 	light.uip1Epoch = uip1FEpoch
-	return &Etchash{light, &Full{turbo: true, ecip1099FBlock: ecip1099FBlock, uip1Epoch: uip1FEpoch}}
+	return &Frkhash{light, &Full{turbo: true, ecip1099FBlock: ecip1099FBlock, uip1Epoch: uip1FEpoch, xip5Block: xip5Block}}
+}
+
+func NewForTestingFrk(xip5Block *uint64) *Frkhash {
+	var light = new(Light)
+	light.ecip1099FBlock = nil
+	light.xip5Block = xip5Block
+	light.uip1Epoch = nil
+	return &Frkhash{light, &Full{turbo: true, ecip1099FBlock: nil, uip1Epoch: nil, xip5Block: xip5Block}}
 }
 
 // NewShared creates an instance of the proof of work., where a single instance
 // of the Light cache is shared across all instances created with NewShared.
-func NewShared(ecip1099FBlock *uint64, uip1FEpoch *uint64) *Etchash {
-	return &Etchash{sharedLight, &Full{turbo: true, ecip1099FBlock: ecip1099FBlock, uip1Epoch: uip1FEpoch}}
+func NewShared(ecip1099FBlock *uint64, uip1FEpoch *uint64, xip5Block *uint64) *Frkhash {
+	return &Frkhash{sharedLight, &Full{turbo: true, ecip1099FBlock: ecip1099FBlock, uip1Epoch: uip1FEpoch, xip5Block: xip5Block}}
 }
 
 // NewForTesting creates a proof of work for use in unit tests.
@@ -764,10 +855,10 @@ func NewShared(ecip1099FBlock *uint64, uip1FEpoch *uint64) *Etchash {
 //
 // Nonces found by a testing instance are not verifiable with a
 // regular-size cache.
-func NewForTesting(ecip1099FBlock *uint64, uip1FEpoch *uint64) (*Etchash, error) {
-	dir, err := ioutil.TempDir("", "etchash-test")
+func NewForTesting(ecip1099FBlock *uint64, uip1FEpoch *uint64, xip5Block *uint64) (*Frkhash, error) {
+	dir, err := ioutil.TempDir("", "frkhash-test")
 	if err != nil {
 		return nil, err
 	}
-	return &Etchash{&Light{test: true}, &Full{Dir: dir, test: true}}, nil
+	return &Frkhash{&Light{test: true}, &Full{Dir: dir, test: true}}, nil
 }
